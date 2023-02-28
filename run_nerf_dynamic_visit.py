@@ -23,9 +23,20 @@ from PIL import Image
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
+# L1_loss = torch.nn.L1Loss
+
+def batchify_DV(fn, chunk):
+    """Constructs a version of 'fn' that applies to smaller batches.
+    """
+
+    if chunk is None:
+        return fn
+    def ret(pts, light_xyz, sin_colat, normal, visit_pred, masks):
+        return torch.cat([fn(pts[i:i+chunk], light_xyz, sin_colat, normal[i:i+chunk], visit_pred[i:i+chunk], masks) for i in range(0, pts.shape[0], chunk)], 0)
+    return ret
 
 
-def batchify_NAV(fn, chunk):
+def batchify_NA(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
     """
 
@@ -59,11 +70,24 @@ def batchify(fn, chunk):
                 }
     return ret
 
+def run_DVnetwork(pts, light_xyz, sin_colat, normal, masks, visit_pred,model, netchunk=1024*64):
+    outputs = batchify_DV(model, netchunk)(pts, light_xyz, sin_colat, normal, masks, visit_pred)
+    return outputs
+
+
 def run_NAVnetwork(inputs, model, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
 
-    outputs = batchify_NAV(model, netchunk)(inputs)
+    outputs = batchify_NA(model, netchunk)(inputs)
+    return outputs
+
+
+def run_NAnetwork(inputs, model, netchunk=1024*64):
+    """Prepares inputs and applies network 'fn'.
+    """
+
+    outputs = batchify_NA(model, netchunk)(inputs)
     return outputs
 
 def run_Rendernetwork(normal_pred, albedo_pred, visit_pred, lights_xyz, areas, pts, model, netchunk=1024*64):
@@ -74,35 +98,35 @@ def run_Rendernetwork(normal_pred, albedo_pred, visit_pred, lights_xyz, areas, p
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
-    with torch.enable_grad():
-        inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-        inputs_flat.requires_grad_(True)
-        embedded = embed_fn(inputs_flat)
+    # with torch.enable_grad():
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    inputs_flat.requires_grad_(True)
+    embedded = embed_fn(inputs_flat)
 
-        if viewdirs is not None:
-            input_dirs = viewdirs[:,None].expand(inputs.shape)
-            input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-            embedded_dirs = embeddirs_fn(input_dirs_flat)
-            embedded = torch.cat([embedded, embedded_dirs], -1)
-        outputs_features = batchify(fn, netchunk)(embedded)
-        outputs_flat = outputs_features['outputs']
-        surface_features = outputs_features['features']
-        sigma = outputs_flat[...,3]
+    if viewdirs is not None:
+        input_dirs = viewdirs[:,None].expand(inputs.shape)
+        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        embedded_dirs = embeddirs_fn(input_dirs_flat)
+        embedded = torch.cat([embedded, embedded_dirs], -1)
+    outputs_features = batchify(fn, netchunk)(embedded)
+    outputs_flat = outputs_features['outputs']
+    surface_features = outputs_features['features']
+    # sigma = outputs_flat[...,3]
 
-        # alpha = torch.abs(alpha)
-        normal_map = -1 * torch.autograd.grad(
-            outputs=sigma,
-            inputs=inputs_flat,
-            grad_outputs=torch.ones_like(sigma, requires_grad=False),
-            retain_graph=True,
-            create_graph=True,
-            )[0]
-        outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-        normal_map = torch.reshape(normal_map, list(inputs.shape[:-1]) + [normal_map.shape[-1]])
-        surface_features = torch.reshape(surface_features, list(inputs.shape[:-1]) + [surface_features.shape[-1]])
-        return {'outputs':outputs,
-                'normal_map': normal_map,
-                'surface_features': surface_features}
+    # alpha = torch.abs(alpha)
+    # normal_map = -1 * torch.autograd.grad(
+    #     outputs=sigma,
+    #     inputs=inputs_flat,
+    #     grad_outputs=torch.ones_like(sigma, requires_grad=False),
+    #     retain_graph=True,
+    #     create_graph=True,
+    #     )[0]
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    # normal_map = torch.reshape(normal_map, list(inputs.shape[:-1]) + [normal_map.shape[-1]])
+    surface_features = torch.reshape(surface_features, list(inputs.shape[:-1]) + [surface_features.shape[-1]])
+    return {'outputs':outputs,
+            'normal_map': None,
+            'surface_features': surface_features}
 
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
@@ -112,11 +136,13 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
-            if k not in all_ret:
-                all_ret[k] = []
-            all_ret[k].append(ret[k])
+            if k!="dynamic_masks":
+                if k not in all_ret:
+                    all_ret[k] = []
+                all_ret[k].append(ret[k])
 
     all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
+    all_ret['dynamic_masks'] = ret['dynamic_masks']
     return all_ret
 
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
@@ -178,10 +204,11 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
+        if k!='dynamic_masks':
+            k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
+            all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map', 'normal_map', 'normal_pred', 'surface_features', 'depth_map', 'rgb_light','albedo','visit']
+    k_extract = ['rgb_map', 'disp_map', 'acc_map','visit', 'dynamic_visit', 'dynamic_masks', 'relight', "albedo", "normal"]
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -204,32 +231,27 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     normal_preds = []
     albedo_preds = []
     visits = []
+    dynamic_visits = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, normal_map,normal_pred, surface_feature, depth_map,rgb_light, albedo_pred, visit_pred, _= render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, visit, dynamic_visit, dynamic_masks,rgb_light, albedo_pred, normal_pred, extras= render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
 
+        print(visit[...,dynamic_masks].shape, dynamic_visit.shape, dynamic_visit[...,10:].shape)
+        visit_ = torch.mean(visit[...,dynamic_masks] * dynamic_visit[...,dynamic_visit.shape[2]//2:], dim = -1)
+        visit_ = visit_.cpu().numpy() * masks[i, :, :, -1]
 
-        normal_map = normal_map.cpu().numpy() * masks[i, :, :, -1][:,:,None]
-        normal_pred = normal_pred.cpu().numpy() * masks[i, :, :, -1][:,:,None]
+        dynamic_visit_ = torch.mean(dynamic_visit, dim = -1)
+        dynamic_visit_ = dynamic_visit_.cpu().numpy() * masks[i, :, :, -1]
 
-        rgblight = rgb_light.cpu().numpy() * masks[i, :, :, -1][:,:,None]
-
-        albedo_pred = albedo_pred.cpu().numpy() * masks[i, :, :, -1][:,:,None]
-
-        visit = torch.mean(visit_pred, dim = -1)
-
-        visit = visit.cpu().numpy() * masks[i, :, :, -1]
-
-        rgbs.append(rgb.cpu().numpy())
-        disps.append(disp.cpu().numpy())
-        normal_maps.append(normal_map)
-        # surface_features.append(surface_feature.cpu().numpy())
+        rgblight = rgb_light.cpu().numpy() * masks[i, :, :, -1][:, :, None]
         rgb_lights.append(rgblight)
         normal_preds.append(normal_pred)
-        visits.append(visit)
+
+        visits.append(visit_)
+        dynamic_visits.append(dynamic_visit_)
         albedo_preds.append(albedo_pred)
 
         if i==0:
@@ -242,21 +264,6 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         """
 
         if savedir is not None:
-            rgb8 = to8b(rgbs[-1])
-            filename = os.path.join(savedir, '{:03d}.png'.format(i))
-            imageio.imwrite(filename, rgb8)
-
-            rgb_normal = normal_maps[-1]
-            rgb_normal = (rgb_normal + 1) / 2
-            rgb_normal = to8b(rgb_normal)
-            filename = os.path.join(savedir, '{:03d}_normal.png'.format(i))
-            imageio.imwrite(filename, rgb_normal)
-
-            rgb_normal = normal_preds[-1]
-            rgb_normal = (rgb_normal + 1) / 2
-            rgb_normal = to8b(rgb_normal)
-            filename = os.path.join(savedir, '{:03d}_normal_pred.png'.format(i))
-            imageio.imwrite(filename, rgb_normal)
 
             rgb_lighting = rgb_lights[-1]
             rgb_lighting = (rgb_lighting + 1) / 2
@@ -264,30 +271,31 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
             filename = os.path.join(savedir, '{:03d}_lighting.png'.format(i))
             imageio.imwrite(filename, rgb_lighting)
 
-            albedo = albedo_preds[-1]
-            albedo = (albedo + 1) / 2
-            albedo = to8b(albedo)
-            filename = os.path.join(savedir, '{:03d}_albedo.png'.format(i))
-            imageio.imwrite(filename, albedo)
 
             visit_img = visits[-1]
-            visit_img = (visit_img + 1) / 2
+            # visit_img = (visit_img + 1) / 2
             visit_img = to8b(visit_img)
             filename = os.path.join(savedir, '{:03d}_visit.png'.format(i))
             imageio.imwrite(filename, visit_img)
 
 
-    rgbs = np.stack(rgbs, 0)
-    disps = np.stack(disps, 0)
-    normal_maps = np.stack(normal_maps, 0)
-    surface_features = np.stack(surface_features, 0)
-    rgb_lights = np.stack(rgb_lights, 0)
+            dynamic_visit_img = dynamic_visits[-1]
+            # dynamic_visit_img = (dynamic_visit_img + 1) / 2
+            dynamic_visit_img = to8b(dynamic_visit_img)
+            filename = os.path.join(savedir, '{:03d}_dynamicvisit.png'.format(i))
+            imageio.imwrite(filename, dynamic_visit_img)
+
+    # rgbs = np.stack(rgbs, 0)
+    # disps = np.stack(disps, 0)
+    # normal_maps = np.stack(normal_maps, 0)
+    # surface_features = np.stack(surface_features, 0)
+    # rgb_lights = np.stack(rgb_lights, 0)
 
 
-    return rgbs, disps, normal_maps, surface_features, rgb_lights
+    return visits, dynamic_visits #rgbs, disps, normal_maps, surface_features, rgb_lights
 
 
-def create_nerf(args, lights_xyz, areas):
+def create_nerf(args, lights_xyz, areas, sin_colat):
     """Instantiate NeRF's MLP model.
     """
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
@@ -318,15 +326,32 @@ def create_nerf(args, lights_xyz, areas):
     nerfstage = False
     normal_model = Normal(D = 2, W = 128, input_ch=args.netwidth_fine, output_ch=3, skips=[2]).to(device)
     albedo_model = Albedo(D=2, W=128, input_ch=args.netwidth_fine, output_ch=3, skips=[2]).to(device)
+
+    ####alpha_models for visit_model
+    alpha_corase= alpha_MLP(D=args.netdepth, W=args.netwidth, input_ch=input_ch, skips=skips,).to(device)
+    alpha_fine = alpha_MLP(D=args.netdepth_fine, W=args.netwidth_fine, input_ch=input_ch, skips=skips,).to(device)
+
+    ckpt_path = "./logs/blender_paper_lego/200000.tar"
+    ckpt = torch.load(ckpt_path)
+    alpha_corase.load_state_dict(ckpt['network_fn_state_dict'], strict = False)
+    alpha_fine.load_state_dict(ckpt['network_fine_state_dict'], strict= False)
+    print("finish loading alpha params from NeRF pts")
+
     visit_model = Visit(D=2, W=128, input_ch=args.netwidth_fine, output_ch=512, skips=[2]).to(device)
+    dynamic_visit_model = Dynamic_Visit(D=2, W=128, input_ch=args.netwidth_fine, output_ch=1, skips=[2], corasenet= alpha_corase, finenet= alpha_fine, ptsembedder = embed_fn, N_samples = args.N_samples, N_importance = args.N_importance, lindisp = args.lindisp, perturb = args.perturb, pytest = False).to(device)
+
+
     render_model = Render(light_h = 16).to(device)
 
-    normal_query = lambda inputs, normal_mode: run_NAVnetwork(inputs, normal_mode,netchunk=args.netchunk)
+    normal_query = lambda inputs, normal_mode: run_NAnetwork(inputs, normal_mode,netchunk=args.netchunk)
 
-    albedo_query = lambda inputs, albedo_model: run_NAVnetwork(inputs, albedo_model,
-                                                                        netchunk=args.netchunk)
+    albedo_query = lambda inputs, albedo_model: run_NAnetwork(inputs, albedo_model, netchunk=args.netchunk)
 
     visit_query = lambda inputs, visit_model: run_NAVnetwork(inputs, visit_model,
+                                                             netchunk=args.netchunk)
+
+
+    dynamic_visit_query = lambda pts, lights_xyz, sin_colat, normal, masks, visit_pred, visit_model: run_DVnetwork(pts, lights_xyz,sin_colat, normal, masks, visit_pred, dynamic_visit_model,
                                                                         netchunk=args.netchunk)
 
     render_query = lambda normal_pred, albedo_pred, visit_pred, lights_xyz, areas, pts, render_model: run_Rendernetwork(normal_pred, albedo_pred, visit_pred, lights_xyz, areas, pts, render_model, netchunk=args.netchunk)
@@ -337,16 +362,15 @@ def create_nerf(args, lights_xyz, areas):
     for name, param in model_fine.named_parameters():
         param.requires_grad = False
 
-    relight_grad_vars = list(normal_model.parameters())
 
-    relight_grad_vars += list(albedo_model.parameters())
+    dynamic_visit_grad_vars = list(dynamic_visit_model.parameters())
+    # normal_grad_vars+=list(albedo_model.parameters())
+    # normal_grad_vars += list(render_model.parameters())
+    # normal_grad_vars += list(normal_model.parameters())
 
-    relight_grad_vars += list(visit_model.parameters())
-
-    relight_grad_vars += list(render_model.parameters())
     # Create optimizer
     # optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
-    optimizer = torch.optim.Adam(params=normal_grad_vars, lr=args.lrate, betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(params=dynamic_visit_grad_vars, lr=args.lrate, betas=(0.9, 0.999))
     start = 0
     basedir = args.basedir
     expname = args.expname
@@ -362,9 +386,11 @@ def create_nerf(args, lights_xyz, areas):
     print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
         ckpt_path = ckpts[-1]
-        ckpt_path = "./logs/blender_paper_lego/350000_normal.tar"  ####relight.tar
+        ckpt_path = "./logs/blender_paper_lego/350000_normal.tar"  ####Relight.tar
+        ckpt_path2 = "./logs/blender_paper_lego/370000_dynamic_visit.tar" ####dynamic_visit.tar
         print('Reloading from', ckpt_path)
         ckpt = torch.load(ckpt_path)
+        ckpt2 = torch.load(ckpt_path2)
 
         start = ckpt['global_step']
 
@@ -374,12 +400,14 @@ def create_nerf(args, lights_xyz, areas):
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
         # if "_relit" in ckpt:
-        normal_model.load_state_dict(ckpt['normal_model'])
+        # normal_model.load_state_dict(ckpt['normal_model'])
         albedo_model.load_state_dict(ckpt['albedo_model'])
         visit_model.load_state_dict(ckpt['visit_model'])
+        normal_model.load_state_dict(ckpt['normal_model'])
+        dynamic_visit_model.load_state_dict(ckpt2['dynamic_visit_model'])
         render_model.load_state_dict(ckpt['render_model'])
 
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        # optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
     ##########################
 
@@ -402,7 +430,10 @@ def create_nerf(args, lights_xyz, areas):
         'render_model' : render_model,
         'render_query' : render_query,
         'lights_xyz' : lights_xyz,
-        'areas' : areas
+        'areas' : areas,
+        'sin_colat' : sin_colat,
+        'dynamic_visit_model' : dynamic_visit_model,
+        'dynamic_visit_query': dynamic_visit_query
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -450,6 +481,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = torch.Tensor(noise)
 
     alpha = raw2alpha(raw['outputs'][...,3] + noise, dists)  # [N_rays, N_samples]
+
     normal_map = raw['normal_map']
     surface_features = raw['surface_features']
 
@@ -458,9 +490,9 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
     # normal_map = torch.reshape(normal_map, [rgb.shape[0],rgb.shape[1],rgb.shape[2]])
-    normal_map = (normal_map * weights.unsqueeze(-1)).mean(-2)
+    # normal_map = (normal_map * weights.unsqueeze(-1)).mean(-2)
     # fg_normal_map = fg_normal_map.mean(-2)
-    normal_map = F.normalize(normal_map, p=2, dim=-1)
+    # normal_map = F.normalize(normal_map, p=2, dim=-1)
 
     # surface_features = torch.reshape(normal_map, [rgb.shape[0],rgb.shape[1],surface_features.shape[-1]])
     surface_features = torch.sum(weights[..., None] * surface_features, -2)
@@ -472,7 +504,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
-    return rgb_map, disp_map, acc_map, weights, depth_map, normal_map, surface_features, depth_map
+    return rgb_map, disp_map, acc_map, weights, depth_map, normal_map, surface_features
 
 
 def render_rays(ray_batch,
@@ -497,7 +529,10 @@ def render_rays(ray_batch,
                 render_model =None,
                 render_query = None,
                 lights_xyz =None,
-                areas =None
+                areas =None,
+                sin_colat = None,
+                dynamic_visit_model =None,
+                dynamic_visit_query = None
                 ):
     """Volumetric rendering.
     Args:
@@ -564,14 +599,15 @@ def render_rays(ray_batch,
 
 #     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map, normal_map, surface_features, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    rgb_map, disp_map, acc_map, weights, depth_map, normal_map, surface_features = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
 
-        rgb_map_0, disp_map_0, acc_map_0, normal_map_0, depth_map_0, surface_features_0 = rgb_map, disp_map, acc_map, normal_map, depth_map, surface_features
+        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
@@ -581,20 +617,31 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map, normal_map, surface_features, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map, normal_map, surface_features = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
 
         pts = rays_o + rays_d * torch.unsqueeze(depth_map, -1).detach()
 
         normal_pred = normal_query(surface_features.detach(), normal_model)
         normal_pred = F.normalize(normal_pred, dim= -1)
-
+        #
         albedo_pred = albedo_query(surface_features.detach(), albedo_model)
         visit_pred = visit_query(surface_features.detach(), visit_model)
-        rgb_light = render_query(normal_pred, albedo_pred, visit_pred, lights_xyz.detach(), areas.detach(), pts, render_model)
+        masks = torch.from_numpy(np.random.choice(512, size=[30], replace=False)).to(device)
+        # masks = torch.from_numpy(np.array([10])).to(device)
+        dynamic_visit_pred = dynamic_visit_query(pts.detach(), lights_xyz.detach(), sin_colat.detach() ,normal_pred.detach(), masks, surface_features.detach(), dynamic_visit_model)
 
+        rgb_light = render_query(normal_pred.detach(), albedo_pred, dynamic_visit_pred, lights_xyz.detach(), areas.detach(), pts, render_model)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'normal_map':normal_map, 'normal_pred':normal_pred, 'surface_features': surface_features, "depth_map":depth_map, "rgb_light": rgb_light, 'albedo':albedo_pred, 'visit' : visit_pred}
+        # N_rays = lights_xyz.shape[0]
+
+        # directions = lights_xyz[None,:,:] - pts[:,None,:] ### N L 3
+        # rays_d = F.normalize(directions, p =2, dim = -1)
+        # cosin = torch.einsum('ijk,ik->ij', rays_d, normal_pred)
+        # cosin = torch.where(cosin>0, 1, 0)
+        # cosin = None
+
+    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map, 'visit' : visit_pred, 'dynamic_visit': dynamic_visit_pred, 'dynamic_masks':masks, 'relight': rgb_light, 'albedo':albedo_pred, "normal":normal_pred}
     if retraw:
         ret['raw'] = raw['outputs']
     if N_importance > 0:
@@ -602,9 +649,6 @@ def render_rays(ray_batch,
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
-        ret['normal_map0'] = normal_map_0
-        ret['depth_map_0'] = depth_map_0
-        ret['surface_features_0'] = surface_features_0
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
@@ -711,7 +755,7 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
-    parser.add_argument("--i_print",   type=int, default=100, 
+    parser.add_argument("--i_print",   type=int, default=100,
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
@@ -725,7 +769,7 @@ def config_parser():
     return parser
 
 
-def train(lights_xyz, areas):
+def train(lights_xyz, areas, sin_colat):
 
     parser = config_parser()
     args = parser.parse_args()
@@ -835,7 +879,7 @@ def train(lights_xyz, areas):
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args, lights_xyz, areas)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args, lights_xyz, areas, sin_colat)
     global_step = start
 
     bds_dict = {
@@ -864,10 +908,10 @@ def train(lights_xyz, areas):
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _, _, surface_features,rgb_lights = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor, masks = masks)
+            visits, dynamic_visits = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor, masks = masks)
             print('Done rendering', testsavedir)
-            imageio.mimwrite(os.path.join(testsavedir, 'rgbvideo.mp4'), to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(os.path.join(testsavedir, 'rgb_lightsvideo.mp4'), to8b(rgb_lights), fps=30, quality=8)
+            # imageio.mimwrite(os.path.join(testsavedir, 'rgbvideo.mp4'), to8b(rgbs), fps=30, quality=8)
+            # imageio.mimwrite(os.path.join(testsavedir, 'rgb_lightsvideo.mp4'), to8b(rgb_lights), fps=30, quality=8)
 
             return
 
@@ -969,22 +1013,68 @@ def train(lights_xyz, areas):
                 # mask_s = mask[select_coords[:, 0], select_coords[:, 1]]
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, normal_map, normal_pred, surface_features, depth_map, rgb_light, albedo,visit, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+        rgb, disp, acc, visit, dynamic_visit, dynamic_masks, rgb_light, albedo, normal,extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
+        # rgb.detach()
+        # normal_map.detach()
+        # surface_features.detach()
 
-        lights = render_kwargs_train["render_model"].lights
-        dx = lights - torch.roll(lights, 1, 1)
-        dy = lights - torch.roll(lights, 1, 0)
-        tv = torch.sum(dx ** 2 + dy ** 2)
+        # normal_pred = normal_model(surface_features.detach())
+        # normal_pred = F.normalize(normal_pred, p =2, dim = -1)
+        #
+        # albedo_pred = albedo_model(surface_features.detach())
+        #
+        # visit_pred = visit_model(surface_features.detach())
+        #
+        #
+        # pts = rays_o + rays_d * torch.unsqueeze(depth_map.detach(), -1)
+        # pts.detach()
+        #
+        # rgb_light = render_model(normal_pred, albedo_pred, visit_pred, lights_xyz.detach(), areas.detach(), pts.detach())
 
+
+        # pred,_ = render_normal(H, W, K, chunk=args.chunk, rays=batch_rays, depth_map = depth_map.detach(),
+        #                                         netquery = render_kwargs_train["network_query_normal"], normal_net =render_kwargs_train["normal_net"] )
+
+        # print(mask_s)
+        # mask = torch.where(mask_s==1.0, 1, 0)
+        # print(torch.sum(mask))
+        # mask = mask[...,0].unsqueeze(-1)
+        # print(torch.sum(mask))
+        # print(mask[0:10,...])
+        # print(target_s[0:10,...])
+        # print(rgb_light[0:10, ...])
+        # print(mask.shape)
+        # mask = mask[...,0].unsqueeze(-1)
+        # print(mask.shape)
+
+        # lights = render_kwargs_train["render_model"].lights
+        # dx = lights - torch.roll(lights, 1, 1)
+        # dy = lights - torch.roll(lights, 1, 0)
+        # tv = torch.sum(dx ** 2 + dy ** 2)
+
+        # mask = torch.where(dynamic_visit[:,0:dynamic_visit.shape[1]//2] >0, 1, 0)
         optimizer.zero_grad()
-        normal_loss = img2mse(normal_pred , normal_map.detach())#, mask)
-        rgb_loss = img2mse(rgb_light, target_s)#, mask)
+        # img_loss = img2mse(rgb, target_s)
+        # print(normal_pred.shape, mask_s.shape)`
+        # print(dynamic_masks.shape)
+        # print(dynamic_visit[0,:])
+        # print(visit[0,dynamic_masks])
+
+        # print(visit[:,0:10])
+        # print(visit[:,dynamic_masks])
+
+        # print(dynamic_visit[:,0:dynamic_visit.shape[1]//2].shape, dynamic_visit[:,dynamic_visit.shape[1]//2:].shape)
+        visit_loss = img2mse(dynamic_visit[:,0:dynamic_visit.shape[1]//2], visit[:,dynamic_masks].detach(), dynamic_visit[:,dynamic_visit.shape[1]//2:])
+        # visit_loss = img2mse(rgb_light, target_s)#, mask)
         trans = extras['raw'][...,-1]
-        loss = rgb_loss + 0.1 * normal_loss + 5e-6 * tv
-        psnr_rgb = mse2psnr(rgb_loss)
-        psnr_normal = mse2psnr(normal_loss)
+        # loss = img_loss
+        loss = visit_loss
+        # print(loss.item())
+        # psnr = mse2psnr(img_loss)
+        psnr_visit = mse2psnr(visit_loss)
+        # psnr_normal = mse2psnr(normal_loss)
         # if 'rgb0' in extras:
         #     img_loss0 = img2mse(extras['rgb0'], target_s)
         #     loss = loss + img_loss0
@@ -1007,17 +1097,19 @@ def train(lights_xyz, areas):
         #####           end            #####
 
         # Rest is logging
-        if i%args.i_weights==0:
-            path = os.path.join(basedir, expname, '{:06d}_relit.tar'.format(i))
+        if i % 1000 == 0:
+        # if i%args.i_weights==0:
+            path = os.path.join(basedir, expname, '{:06d}_dynamic_visit.tar'.format(i))
             torch.save({
                 'global_step': global_step,
                 # 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                 # 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                "render_model": render_kwargs_train['render_model'].state_dict(),
-                'normal_model':render_kwargs_train['normal_model'].state_dict(),
-                'albedo_model':render_kwargs_train['albedo_model'].state_dict(),
-                'visit_model':render_kwargs_train['visit_model'].state_dict()
+                # "render_model": render_kwargs_train['render_model'].state_dict(),
+                # 'normal_model':render_kwargs_train['normal_model'].state_dict(),
+                # 'albedo_model':render_kwargs_train['albedo_model'].state_dict(),
+                # 'visit_model':render_kwargs_train['visit_model'].state_dict(),
+                'dynamic_visit_model': render_kwargs_train['dynamic_visit_model'].state_dict(),
             }, path)
             print('Saved checkpoints at', path)
 
@@ -1047,7 +1139,7 @@ def train(lights_xyz, areas):
             print('Saved test set')
 
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss_rgb: {rgb_loss.item()} Loss_normal: {normal_loss.item()} PSNR_rgb: {psnr_rgb.item()} PSNR_normal: {psnr_normal.item()} Loss_light: {tv.item()} ")
+            tqdm.write(f"[TRAIN] Iter: {i} Loss_visit: {visit_loss.item()} PSNR_visit: {psnr_visit.item()} ")
             # tqdm.write(
             #     f"[TRAIN] Iter: {i} Loss_rgb: {rgb_loss.item()}  PSNR_rgb: {psnr_rgb.item()} ")
             # print(normal_pred[0:2, ...], normal_map[0:2, ...])
@@ -1099,16 +1191,21 @@ def train(lights_xyz, areas):
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    lights_xyz, areas = gen_light_xyz(envmap_h=16, envmap_w=32)
+    lights_xyz, areas, sin_colat = gen_light_xyz(envmap_h=16, envmap_w=32)
     areas = torch.tensor(areas, dtype=torch.float32).to(device)
+    sin_colat = torch.tensor(sin_colat, dtype=torch.float32).to(device) *100
+
     lights_xyz = torch.tensor(lights_xyz, dtype=torch.float32).to(device)
     areas = areas.unsqueeze(-1).reshape(-1, 1)
+    sin_colat = sin_colat.unsqueeze(-1).reshape(-1, 1)
     lights_xyz = lights_xyz.reshape(-1, 3)
-    lights_xyz = F.normalize(lights_xyz, p=2, dim=-1)
+    print(lights_xyz[[5,511], ...])
+    # lights_xyz = F.normalize(lights_xyz, p=2, dim=-1)
 
     # areas = torch.tile(areas.unsqueeze(0), (160000, 1, 3))
 
     torch.cuda.manual_seed(10)
     np.random.seed(10)
+    print(lights_xyz[[5,511],...])
 
-    train(lights_xyz, areas)
+    train(lights_xyz, areas, sin_colat)
