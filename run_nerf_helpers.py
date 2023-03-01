@@ -374,9 +374,9 @@ class Dynamic_Visit(nn.Module):
         '''
         if self.mode == "test":
             Visits = []
-            for i in range(0, 512, 100):
-                lights_xyz_ = lights_xyz[i: min(i+100, 512),...]
-                sin_colat_ = sin_colat[i: min(i+100, 512),...]
+            for i in range(0, 512, 50):
+                lights_xyz_ = lights_xyz[i: min(i+50, 512),...]
+                sin_colat_ = sin_colat[i: min(i+50, 512),...]
 
                 rays_d = lights_xyz_[None,:,:] - pts[:,None,:] ### N L 3
                 rays_d = F.normalize(rays_d, p =2, dim = -1)
@@ -431,8 +431,21 @@ class Dynamic_Visit(nn.Module):
                 # alpha_c = torch.zeros(alpha_c.shape).cuda()
                 # alpha_c = self.embedder(alpha_c)
 
+
+                x_thed_1 = pts_[...,0]< 100
+                x_thed_2 = pts_[..., 0] > -100
+                y_thed_1 = pts_[..., 1] < 100
+                y_thed_2 = pts_[..., 1] > -100
+                z_thed_1 = pts_[..., 2] < 0.1
+                z_thed_2 = pts_[..., 2] > -100
+                xyz_thed = x_thed_1 * y_thed_1 * z_thed_1 * x_thed_2 * y_thed_2 * z_thed_2
+
+
+
                 if 1:#torch.mean(alpha_c) > self.alpha_thred:
                     h = sigma_c.detach()
+
+                    h = h + (xyz_thed * -1000)
 
                     h = torch.cat([h, torch.tile(suface_features.unsqueeze(1), [1, h.shape[1], 1])], dim=-1)
                     for i, l in enumerate(self.visit_linears_corase):
@@ -446,6 +459,8 @@ class Dynamic_Visit(nn.Module):
                     # Visit = Visit.reshape(alpha_c.shape[0],alpha_c.shape[1])* cosin
                     Visit = Visit[...,0] * cosin
                     Visits.append(Visit)
+
+                    del sigma_c
 
                     # print("pred",Visit[0,0])
                 else:

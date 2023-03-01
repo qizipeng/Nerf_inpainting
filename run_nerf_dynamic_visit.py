@@ -133,7 +133,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
+    for i in trange(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k!="dynamic_masks":
@@ -240,17 +240,21 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         rgb, disp, acc, visit, dynamic_visit, dynamic_masks,rgb_light, albedo_pred, normal_pred, extras= render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
 
         print(visit[...,dynamic_masks].shape, dynamic_visit.shape, dynamic_visit[...,10:].shape)
-        visit_ = torch.mean(visit[...,dynamic_masks] * dynamic_visit[...,dynamic_visit.shape[2]//2:], dim = -1)
-        visit_ = visit_.cpu().numpy() * masks[i, :, :, -1]
+        # visit_ = torch.mean(visit[...,dynamic_masks] * dynamic_visit[...,dynamic_visit.shape[2]//2:], dim = -1)
+        # visit_ = visit_.cpu().numpy() * masks[i, :, :, -1]
 
         dynamic_visit_ = torch.mean(dynamic_visit, dim = -1)
         dynamic_visit_ = dynamic_visit_.cpu().numpy() * masks[i, :, :, -1]
+        # print(rgb_light[masks[i, :, :, -1], 0].shape, rgb_light[..., 0].shape, rgb_light[..., 0] / torch.max(rgb_light[masks[i, :, :, -1], 0]).shape )
 
+        # rgb_light[masks[i, :, :, -1], 0] = rgb_light[masks[i, :, :, -1], 0] / torch.max(rgb_light[masks[i, :, :, -1], 0])
+        # rgb_light[masks[i, :, :, -1], 0] = rgb_light[masks[i, :, :, -1], 1] / torch.max(rgb_light[masks[i, :, :, -1], 1])
+        # rgb_light[masks[i, :, :, -1], 0] = rgb_light[masks[i, :, :, -1], 2] / torch.max(rgb_light[masks[i, :, :, -1], 2])
         rgblight = rgb_light.cpu().numpy() * masks[i, :, :, -1][:, :, None]
         rgb_lights.append(rgblight)
         normal_preds.append(normal_pred)
 
-        visits.append(visit_)
+        # visits.append(visit_)
         dynamic_visits.append(dynamic_visit_)
         albedo_preds.append(albedo_pred)
 
@@ -266,17 +270,17 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         if savedir is not None:
 
             rgb_lighting = rgb_lights[-1]
-            rgb_lighting = (rgb_lighting + 1) / 2
+            # rgb_lighting = (rgb_lighting + 1) / 2
             rgb_lighting = to8b(rgb_lighting)
             filename = os.path.join(savedir, '{:03d}_lighting.png'.format(i))
             imageio.imwrite(filename, rgb_lighting)
 
 
-            visit_img = visits[-1]
-            # visit_img = (visit_img + 1) / 2
-            visit_img = to8b(visit_img)
-            filename = os.path.join(savedir, '{:03d}_visit.png'.format(i))
-            imageio.imwrite(filename, visit_img)
+            # visit_img = visits[-1]
+            # # visit_img = (visit_img + 1) / 2
+            # visit_img = to8b(visit_img)
+            # filename = os.path.join(savedir, '{:03d}_visit.png'.format(i))
+            # imageio.imwrite(filename, visit_img)
 
 
             dynamic_visit_img = dynamic_visits[-1]
@@ -1199,13 +1203,9 @@ if __name__=='__main__':
     areas = areas.unsqueeze(-1).reshape(-1, 1)
     sin_colat = sin_colat.unsqueeze(-1).reshape(-1, 1)
     lights_xyz = lights_xyz.reshape(-1, 3)
-    print(lights_xyz[[5,511], ...])
     # lights_xyz = F.normalize(lights_xyz, p=2, dim=-1)
-
-    # areas = torch.tile(areas.unsqueeze(0), (160000, 1, 3))
 
     torch.cuda.manual_seed(10)
     np.random.seed(10)
-    print(lights_xyz[[5,511],...])
 
     train(lights_xyz, areas, sin_colat)
